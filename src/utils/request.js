@@ -25,7 +25,17 @@ service.defaults.transformRequest = [function (data) {
   return ret;
 }]*/
 
-const install = (Vue, option = {}) =>{
+// create unique urlId
+var uniqueKeyString = function (url, method, data) {
+  method = method.toUpperCase()
+  return Qs.stringify(
+    Object.assign({}, {url, method}, data)
+  );
+}
+// counter
+let counter = 0
+
+const install = function(Vue, option = {}){
   // 防止多次调用
   if(install.installed) return
   install.installed = true
@@ -33,22 +43,30 @@ const install = (Vue, option = {}) =>{
   // 请求拦截器
   service.interceptors.request.use(
     config => {
+      counter++
       if (store.getters.token) {
         config.headers['Authorization'] = getToken()
       }
-
-      if (!config.ajaxOpt.noAbort) {
+      if (!config.data._ajaxOpt.noAbort) {
+        delete config.data._ajaxOpt
+        let _uniqueKeyString = uniqueKeyString(config.url, config.method, config.data)
         // 如果它是不被abort的，才加进map
         // 防止重复提交
-        if(ajaxMap.has(config.uniqueKeyString)) {
+        if(ajaxMap.has(_uniqueKeyString)) {
           config.cancelToken = new CancelToken(cancel => {
+            counter--
             cancel('request repeat, request cancel')
           })
         }
         ajaxMap.set(
-          config.uniqueKeyString,
-          cancelMap.get(config.uniqueKeyString)
+          _uniqueKeyString,
+          cancelMap.get(_uniqueKeyString)
         )
+      }
+
+      if(config.params) {
+        let data = config.params
+        delete data._ajaxOpt
       }
 
       if(config.method === 'post' || config.method === 'put'){
@@ -60,7 +78,6 @@ const install = (Vue, option = {}) =>{
           }
         ]
       }
-
       return config
     },error => {
       console.log(error)
@@ -71,17 +88,17 @@ const install = (Vue, option = {}) =>{
   // 响应拦截器
   service.interceptors.response.use(
     response => {
+      counter--
       const res = response.data
-      //响应回来后，删掉ajaxMap里面的
-      ajaxMap.delete(response.config.uniqueKeyString);
-      if(!res) return false
-      if (res.code !== 20000) {
+      // 响应回来后，删掉ajaxMap里面的
+      let config = response.config
+      ajaxMap.delete(uniqueKeyString(config.url, config.method, config.data));
+      if (response.status !== 200) {
         Message({
           message: res.message || 'Error',
           type: 'error'
         })
-        // 50008: Illegal token; 50012: Other clients logged in; 50014: Token expired;
-        if (res.code === 50008 || res.code === 50012 || res.code === 50014) {
+        if (response.status === 50008 || response.status === 50012 || response.status === 50014) {
           // to re-login
           MessageBox.confirm('You have been logged out, you can cancel to stay on this page, or log in again', 'Confirm logout', {
             confirmButtonText: 'Re-Login',
@@ -94,12 +111,19 @@ const install = (Vue, option = {}) =>{
             })
           })
         }
-        return Promise.reject(new Error(res.message || 'Error'))
+        console.error(res)
+        return false
       }else {
         return res
       }
     }, error => {
-      console.log(error);
+      if(--counter <= 0) {
+        counter = 0
+        for (let params of ajaxMap.entries()){
+          ajaxMap.delete(params[0])
+        }
+      }
+      // 响应回来后，删掉ajaxMap里面的
       if (error && error.response) {
         switch (error.response.status) {
           case 401:
@@ -114,10 +138,11 @@ const install = (Vue, option = {}) =>{
             Message.error('服务器忙，请重试')
             break;
           default:
-            Message.error('连接错误')
+            Message.error('连接错误，请稍后再试')
         }
       }
-      return Promise.reject(error);
+      console.log(error)
+      return false;
     }
   )
 
@@ -134,27 +159,21 @@ const install = (Vue, option = {}) =>{
     }
     ajaxParams.data = ajaxParams.data || {}
     ajaxParams.params = ajaxParams.method.toUpperCase() === 'GET' && ajaxParams.data
-
-    // create unique urlId
-    const uniqueKeyString = Qs.stringify(
-      Object.assign({}, {url:ajaxParams.url, method:ajaxParams.method}, ajaxParams.data)
-    );
-
+    let _uniqueKeyString = uniqueKeyString(ajaxParams.url, ajaxParams.method, ajaxParams.data)
+    ajaxParams.data._ajaxOpt = ajaxOpt
     return service({
       ...ajaxParams,
       cancelToken: new CancelToken(c=>{
-        cancelMap.set(uniqueKeyString, c)
-      }),
-      ajaxOpt,
-      uniqueKeyString
+        cancelMap.set(_uniqueKeyString, c)
+      })
     });
-
   }
 
   Vue.abort = Vue.prototype.$abort = () => {
     for (let params of ajaxMap.entries()){
       let key = params[0], cancel = params[1];
       cancel('router change, request cancel');
+      counter=0;
       ajaxMap.delete(key)
     }
   }
@@ -163,6 +182,7 @@ const install = (Vue, option = {}) =>{
       let key = params[0], cancel = params[1];
       if(url === Qs.parse(key)['url']) {
         cancel();
+        if(--counter <= 0) counter = 0
         ajaxMap.delete(key)
       }
     }
